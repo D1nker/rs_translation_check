@@ -194,7 +194,6 @@ fn main() {
 
     println!("{}", "🌍 Translation Consistency Check".bold().underline());
 
-    // Print all results at the end
     print!("{}", output);
 
     if has_errors {
