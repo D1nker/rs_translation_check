@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::process;
 
 // Extracts variables in `{name}` format from a translation string
@@ -43,12 +44,11 @@ fn check_translations(
     translations: &HashMap<String, HashMap<String, String>>,
     file_mapping: &HashMap<String, HashMap<String, String>>,
     progress_bar: &ProgressBar,
-) -> (bool, String) {
+) -> bool {
     let base_keys: HashSet<_> = translations.get(base_lang).unwrap().keys().collect();
     let mut has_errors = false;
-    let mut output = String::new();
 
-    let mut processed_keys = 0;
+    let mut progress_bar_progress = 0;
 
     for (lang, keys) in translations {
         if lang == base_lang {
@@ -59,22 +59,21 @@ fn check_translations(
         let missing_keys: Vec<_> = base_keys.difference(&other_keys).collect();
         let extra_keys: Vec<_> = other_keys.difference(&base_keys).collect();
 
-        output.push_str(&format!(
-            "\n🔍 Checking {}\n",
-            lang.to_uppercase().bold().blue()
-        ));
+        println!("\n🔍 Checking {}", lang.to_uppercase().bold().blue());
 
         if !missing_keys.is_empty() {
-            output.push_str(&"❌ Missing keys:\n".bold().red().to_string());
+            println!("{}", "❌ Missing keys:".bold().red());
             for key in &missing_keys {
-                output.push_str(&format!("   - {}\n", key.red()));
+                println!("   - {}", key.red());
+                io::stdout().flush().unwrap(); // Flush immediately
             }
             has_errors = true;
         }
         if !extra_keys.is_empty() {
-            output.push_str(&"⚠️ Extra keys:\n".bold().yellow().to_string());
+            println!("{}", "⚠️ Extra keys:".bold().yellow());
             for key in &extra_keys {
-                output.push_str(&format!("   - {}\n", key.yellow()));
+                println!("   - {}", key.yellow());
+                io::stdout().flush().unwrap();
             }
             has_errors = true;
         }
@@ -84,24 +83,19 @@ fn check_translations(
             let other_vars = extract_variables(translations[lang].get(*key).unwrap());
 
             if base_vars != other_vars {
-                output.push_str(
-                    &"🔄 Variable mismatch detected!\n"
-                        .bold()
-                        .magenta()
-                        .to_string(),
-                );
-                output.push_str(&format!("   - Key: {}\n", key.magenta()));
+                println!("{}", "🔄 Variable mismatch detected!".bold().magenta());
+                println!("   - Key: {}", key.magenta());
 
-                output.push_str(&format!(
-                    "   - Expected variables ({}): {}\n",
+                println!(
+                    "   - Expected variables ({}): {}",
                     base_lang.to_uppercase().bold(),
                     format!("{:?}", base_vars).green()
-                ));
-                output.push_str(&format!(
-                    "   - Found variables ({}): {}\n",
+                );
+                println!(
+                    "   - Found variables ({}): {}",
                     lang.to_uppercase().bold(),
                     format!("{:?}", other_vars).cyan()
-                ));
+                );
 
                 let base_file = file_mapping
                     .get(base_lang)
@@ -115,36 +109,52 @@ fn check_translations(
                     .cloned()
                     .unwrap_or_else(|| "Unknown file".to_string());
 
-                output.push_str(&format!(
-                    "   - Location: Expected in {} but found in {}\n",
+                println!(
+                    "   - Location: Expected in {} but found in {}",
                     base_file.yellow(),
                     other_file.blue()
-                ));
+                );
 
+                io::stdout().flush().unwrap();
                 has_errors = true;
             }
 
-            processed_keys += 1;
-            progress_bar.set_position(processed_keys as u64);
+            progress_bar_progress += 1;
+            progress_bar.set_position(progress_bar_progress as u64);
         }
 
         if missing_keys.is_empty() && extra_keys.is_empty() && !has_errors {
-            output.push_str(&"✅ All keys are consistent!\n".bold().green().to_string());
+            println!("{}", "✅ All keys are consistent!".bold().green());
         }
     }
 
-    (has_errors, output)
+    has_errors
 }
-
 // Loads all translation files and checks consistency
 fn main() {
     let args: Vec<String> = env::args().collect();
+
     let base_path = args
         .get(1)
         .map(|s| s.as_str())
-        .unwrap_or("./webapp/src/assets/i18n");
+        .unwrap_or("../../circularx/webapp/src/assets/i18n");
 
-    let lang_files = vec!["fr", "en", "de", "nl"];
+    let lang_folders = fs::read_dir(base_path)
+        .expect("Failed to read directory")
+        .filter_map(|entry| {
+            entry.ok().and_then(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    entry.file_name().into_string().ok()
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<String>>();
+
+    println!("{:?}", lang_folders);
+
     let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut file_mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
 
@@ -157,10 +167,10 @@ fn main() {
             .tick_chars("=>-|"),
     );
 
-    for lang in &lang_files {
+    for lang in &lang_folders {
         let pattern = format!("{}/{}/*.json", base_path, lang);
-        let mut lang_data = HashMap::new();
-        let mut lang_files = HashMap::new();
+        let mut translations_keys_and_values: HashMap<String, String> = HashMap::new();
+        let mut translations_keys_and_paths: HashMap<String, String> = HashMap::new();
 
         for entry in glob(&pattern).expect("Failed to read glob pattern") {
             if let Ok(path) = entry {
@@ -171,30 +181,29 @@ fn main() {
                 flatten_json(&json, "".to_string(), &mut flattened);
 
                 for (key, value) in flattened {
-                    lang_data.insert(key.clone(), value);
-                    lang_files.insert(key, path.to_string_lossy().to_string());
+                    translations_keys_and_values.insert(key.clone(), value);
+                    translations_keys_and_paths.insert(key, path.to_string_lossy().to_string());
                 }
             }
         }
-        translations.insert(lang.to_string(), lang_data);
-        file_mapping.insert(lang.to_string(), lang_files);
+
+        translations.insert(lang.to_string(), translations_keys_and_values);
+        file_mapping.insert(lang.to_string(), translations_keys_and_paths);
     }
 
-    let total_keys: usize = translations.values().map(|keys| keys.len()).sum();
-    progress_bar.set_length(total_keys as u64);
+    let total_entries: usize = translations.values().map(|keys| keys.len()).sum();
+    progress_bar.set_length(total_entries as u64);
 
     progress_bar.set_message(format!(
         "{} - Checking translations...",
         "🚀 Progress".bold().cyan()
     ));
-    let (has_errors, output) =
-        check_translations("fr", &translations, &file_mapping, &progress_bar);
+
+    let has_errors = check_translations("fr", &translations, &file_mapping, &progress_bar);
 
     progress_bar.finish_with_message("Translation check complete ✅.");
 
     println!("{}", "🌍 Translation Consistency Check".bold().underline());
-
-    print!("{}", output);
 
     if has_errors {
         println!(
