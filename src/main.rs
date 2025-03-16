@@ -190,18 +190,6 @@ fn main() {
         })
         .sum();
 
-    println!(
-        "{} {} language folders found.",
-        "ℹ️ Info:".bold().cyan(),
-        total_folders
-    );
-
-    println!(
-        "{} {} translation files found across all folders.",
-        "ℹ️ Info:".bold().cyan(),
-        total_files
-    );
-
     let translations = Arc::new(DashMap::new());
     let file_mapping = Arc::new(DashMap::new());
 
@@ -249,6 +237,18 @@ fn main() {
             }
         })
         .collect::<HashSet<String>>();
+
+    println!(
+        "{} {} language folders found.",
+        "ℹ️ Info:".bold().cyan(),
+        total_folders
+    );
+
+    println!(
+        "{} {} translation files found across all folders.",
+        "ℹ️ Info:".bold().cyan(),
+        total_files
+    );
 
     println!(
         "\n{}",
