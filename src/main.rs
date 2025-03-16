@@ -7,11 +7,10 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::process;
 use std::sync::{Arc, Mutex};
 
-// Extracts variables in `{name}` format from a translation string
+// Extracts variables like `{productName}` format from a translation string
 fn extract_variables(text: &str) -> HashSet<String> {
     let translation_variable_regex = Regex::new(r"\{(\w+)}").unwrap();
     translation_variable_regex
