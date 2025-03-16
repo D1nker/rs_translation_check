@@ -1,6 +1,7 @@
 use colored::*;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -8,6 +9,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process;
+use std::sync::{Arc, Mutex};
 
 // Extracts variables in `{name}` format from a translation string
 fn extract_variables(text: &str) -> HashSet<String> {
@@ -38,26 +40,26 @@ fn flatten_json(value: &Value, prefix: String, output: &mut HashMap<String, Stri
     }
 }
 
-// Checks translation consistency across languages and updates progress bar
+// Checks translation consistency across languages in parallel
 fn check_translations(
     base_lang: &str,
-    translations: &HashMap<String, HashMap<String, String>>,
-    file_mapping: &HashMap<String, HashMap<String, String>>,
-    progress_bar: &ProgressBar,
+    translations: Arc<HashMap<String, HashMap<String, String>>>,
+    file_mapping: Arc<HashMap<String, HashMap<String, String>>>,
+    progress_bar: Arc<ProgressBar>,
 ) -> bool {
     let base_keys: HashSet<_> = translations.get(base_lang).unwrap().keys().collect();
-    let mut has_errors = false;
+    let has_errors = Arc::new(Mutex::new(false));
 
-    let mut progress_bar_progress = 0;
-
-    for (lang, keys) in translations {
+    translations.par_iter().for_each(|(lang, keys)| {
         if lang == base_lang {
-            continue;
+            return;
         }
 
         let other_keys: HashSet<_> = keys.keys().collect();
         let missing_keys: Vec<_> = base_keys.difference(&other_keys).collect();
         let extra_keys: Vec<_> = other_keys.difference(&base_keys).collect();
+
+        let mut local_errors = false;
 
         println!("\n🔍 Checking {}", lang.to_uppercase().bold().blue());
 
@@ -65,17 +67,15 @@ fn check_translations(
             println!("{}", "❌ Missing keys:".bold().red());
             for key in &missing_keys {
                 println!("   - {}", key.red());
-                io::stdout().flush().unwrap(); // Flush immediately
             }
-            has_errors = true;
+            local_errors = true;
         }
         if !extra_keys.is_empty() {
             println!("{}", "⚠️ Extra keys:".bold().yellow());
             for key in &extra_keys {
                 println!("   - {}", key.yellow());
-                io::stdout().flush().unwrap();
             }
-            has_errors = true;
+            local_errors = true;
         }
 
         for key in base_keys.intersection(&other_keys) {
@@ -115,31 +115,33 @@ fn check_translations(
                     other_file.blue()
                 );
 
-                io::stdout().flush().unwrap();
-                has_errors = true;
+                local_errors = true;
             }
 
-            progress_bar_progress += 1;
-            progress_bar.set_position(progress_bar_progress as u64);
+            progress_bar.inc(1);
         }
 
-        if missing_keys.is_empty() && extra_keys.is_empty() && !has_errors {
+        if missing_keys.is_empty() && extra_keys.is_empty() && !local_errors {
             println!("{}", "✅ All keys are consistent!".bold().green());
         }
-    }
 
-    has_errors
+        if local_errors {
+            *has_errors.lock().unwrap() = true;
+        }
+    });
+
+    *has_errors.lock().unwrap()
 }
-// Loads all translation files and checks consistency
+
+// Loads all translation files and checks consistency in parallel
 fn main() {
     let args: Vec<String> = env::args().collect();
-
     let base_path = args
         .get(1)
         .map(|s| s.as_str())
         .unwrap_or("../../circularx/webapp/src/assets/i18n");
 
-    let lang_folders = fs::read_dir(base_path)
+    let lang_folders: Vec<String> = fs::read_dir(base_path)
         .expect("Failed to read directory")
         .filter_map(|entry| {
             entry.ok().and_then(|entry| {
@@ -151,15 +153,15 @@ fn main() {
                 }
             })
         })
-        .collect::<Vec<String>>();
+        .collect();
 
     println!("{:?}", lang_folders);
 
-    let mut translations: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut file_mapping: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let translations = Arc::new(Mutex::new(HashMap::new()));
+    let file_mapping = Arc::new(Mutex::new(HashMap::new()));
 
     // Progress bar setup
-    let progress_bar = ProgressBar::new(100);
+    let progress_bar = Arc::new(ProgressBar::new(100));
     progress_bar.set_style(
         ProgressStyle::with_template("{bar:40.green} {pos:>7}/{len:7} ({eta}) {msg}")
             .unwrap()
@@ -167,10 +169,10 @@ fn main() {
             .tick_chars("=>-|"),
     );
 
-    for lang in &lang_folders {
+    lang_folders.par_iter().for_each(|lang| {
         let pattern = format!("{}/{}/*.json", base_path, lang);
-        let mut translations_keys_and_values: HashMap<String, String> = HashMap::new();
-        let mut translations_keys_and_paths: HashMap<String, String> = HashMap::new();
+        let mut translations_keys_and_values = HashMap::new();
+        let mut translations_keys_and_paths = HashMap::new();
 
         for entry in glob(&pattern).expect("Failed to read glob pattern") {
             if let Ok(path) = entry {
@@ -187,19 +189,37 @@ fn main() {
             }
         }
 
-        translations.insert(lang.to_string(), translations_keys_and_values);
-        file_mapping.insert(lang.to_string(), translations_keys_and_paths);
-    }
+        translations
+            .lock()
+            .unwrap()
+            .insert(lang.to_string(), translations_keys_and_values);
+        file_mapping
+            .lock()
+            .unwrap()
+            .insert(lang.to_string(), translations_keys_and_paths);
+    });
 
-    let total_entries: usize = translations.values().map(|keys| keys.len()).sum();
+    let total_entries: usize = translations
+        .lock()
+        .unwrap()
+        .values()
+        .map(|keys| keys.len())
+        .sum();
     progress_bar.set_length(total_entries as u64);
-
     progress_bar.set_message(format!(
         "{} - Checking translations...",
         "🚀 Progress".bold().cyan()
     ));
 
-    let has_errors = check_translations("fr", &translations, &file_mapping, &progress_bar);
+    let translations = Arc::new(translations.lock().unwrap().clone());
+    let file_mapping = Arc::new(file_mapping.lock().unwrap().clone());
+
+    let has_errors = check_translations(
+        "fr",
+        Arc::clone(&translations),
+        Arc::clone(&file_mapping),
+        Arc::clone(&progress_bar),
+    );
 
     progress_bar.finish_with_message("Translation check complete ✅.");
 
