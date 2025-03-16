@@ -69,7 +69,9 @@ fn check_translations(
 ) -> bool {
     let base_translation = translations.get(base_lang).unwrap();
     let base_keys: HashSet<_> = base_translation.keys().collect();
+
     let has_errors = Arc::new(Mutex::new(false));
+
     let mut impacted_folders = HashSet::new();
     let mut impacted_files = HashSet::new();
 
@@ -193,6 +195,7 @@ fn main() {
         "ℹ️ Info:".bold().cyan(),
         total_folders
     );
+
     println!(
         "{} {} translation files found across all folders.",
         "ℹ️ Info:".bold().cyan(),

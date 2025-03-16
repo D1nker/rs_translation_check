@@ -5,7 +5,7 @@ This Rust script checks the consistency of translation files across multiple lan
 
 - All languages have the same translation keys.
 - There are no missing or extra keys in any language.
-- Variables within translations (e.g., `{name}`) are consistent across all languages.
+- Variables within translations (e.g., `{productName}`) are consistent across all languages.
 
 ## Features
 
