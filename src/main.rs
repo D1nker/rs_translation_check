@@ -1,18 +1,18 @@
 use colored::*;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use glob::glob;
 use lazy_static::lazy_static;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 lazy_static! {
     static ref TRANSLATION_VAR_REGEX: Regex = Regex::new(r"\{(\w+)}").unwrap();
@@ -37,46 +37,94 @@ fn get_translation_file<'a>(
         .unwrap_or_else(|| "Unknown file".to_string())
 }
 
-// Recursively flattens a JSON structure into dot-separated keys
 fn flatten_json(value: &Value, prefix: String, output: &DashMap<String, String>) {
-    match value {
-        Value::Object(map) => {
-            // Convert the map into a Vec of (key, value) tuples and use par_iter() on the Vec
-            map.iter()
-                .collect::<Vec<_>>() // Convert the map into a Vec of tuples
-                .par_iter() // Parallel iteration
-                .for_each(|(key, val)| {
-                    let new_key = if prefix.is_empty() {
-                        key.to_string()
+    let mut stack = vec![(prefix, value)];
+
+    while let Some((curr_prefix, curr_value)) = stack.pop() {
+        match curr_value {
+            Value::Object(map) => {
+                for (key, val) in map {
+                    let new_key = if curr_prefix.is_empty() {
+                        key.clone()
                     } else {
-                        format!("{}.{}", prefix, key)
+                        format!("{}.{}", curr_prefix, key)
                     };
-                    flatten_json(val, new_key, output); // Recursive call
-                });
+                    stack.push((new_key, val));
+                }
+            }
+            Value::String(text) => {
+                output.insert(curr_prefix, text.clone());
+            }
+            _ => {}
         }
-        Value::String(text) => {
-            output.insert(prefix, text.clone());
-        }
-        _ => {}
     }
 }
 
-// Checks translation consistency across languages in parallel
+fn extract_keys_from_content(content: &str, base_keys: &HashSet<String>) -> HashSet<String> {
+    let used_keys: HashSet<String> = base_keys
+        .par_iter()
+        .filter(|key| content.contains(*key))
+        .cloned()
+        .collect();
+
+    used_keys
+}
+
+fn get_all_files_by_extension(path: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = path.read_dir() {
+        files.extend(entries.filter_map(Result::ok).flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                get_all_files_by_extension(&path, extension)
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+                vec![path]
+            } else {
+                vec![]
+            }
+        }));
+    }
+    files
+}
+
+fn process_files(files: &[PathBuf], base_keys: &HashSet<String>) -> HashSet<String> {
+    let used_keys: HashSet<String> = files
+        .par_iter()
+        .filter_map(|file_path| {
+            if let Ok(content) = fs::read_to_string(file_path) {
+                Some(extract_keys_from_content(&content, base_keys))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    used_keys
+}
+
+fn check_translations_usage(base_keys: &HashSet<String>, files: &[PathBuf]) -> HashSet<String> {
+    let used_keys = process_files(files, base_keys);
+
+    let unused_keys: HashSet<_> = base_keys.difference(&used_keys).cloned().collect();
+
+    unused_keys
+}
+
 fn check_translations(
     base_lang: &str,
     translations: Arc<DashMap<String, HashMap<String, String>>>,
     file_mapping: Arc<DashMap<String, HashMap<String, String>>>,
+    unused_keys: &DashSet<String>, // We're now using unused_keys here
 ) -> bool {
-    let base_translation = translations.get(base_lang).unwrap();
+    let base_translation = translations.get("fr").unwrap();
     let base_keys: HashSet<_> = base_translation.keys().collect();
+    let has_errors = Arc::new(AtomicBool::new(false));
 
-    let has_errors = Arc::new(Mutex::new(false));
+    let impacted_files = DashSet::new();
 
-    let mut impacted_folders = HashSet::new();
-    let mut impacted_files = HashSet::new();
-
-    // Dereference translations to access the DashMap and use `par_iter` on it
-    translations.as_ref().iter().for_each(|entry| {
+    translations.iter().par_bridge().for_each(|entry| {
         let (lang, keys) = entry.pair();
         if lang == base_lang {
             return;
@@ -87,8 +135,6 @@ fn check_translations(
         let extra_keys: Vec<_> = other_keys.difference(&base_keys).collect();
 
         let mut local_errors = false;
-
-        println!("\n🔍 Checking {}", lang.to_uppercase().bold().blue());
 
         if !missing_keys.is_empty() {
             println!("{}", "❌ Missing keys:".bold().red());
@@ -111,7 +157,6 @@ fn check_translations(
         for key in base_keys.intersection(&other_keys) {
             let base_vars =
                 extract_variables(translations.get(base_lang).unwrap().get(*key).unwrap());
-
             let other_vars = extract_variables(translations.get(lang).unwrap().get(*key).unwrap());
 
             if base_vars != other_vars {
@@ -120,42 +165,48 @@ fn check_translations(
 
                 println!("{}", "🔄 Variable mismatch detected!".bold().magenta());
                 println!("   - Key: {}", key.magenta());
-
                 println!(
                     "   - Expected variables ({}): {}",
                     base_lang.to_uppercase().bold(),
                     format!("{:?}", base_vars).green()
                 );
-
                 println!(
                     "   - Found variables ({}): {}",
                     lang.to_uppercase().bold(),
                     format!("{:?}", other_vars).cyan()
                 );
-
                 println!(
                     "   - Location: Expected in {} but found in {}",
                     base_file.yellow(),
                     other_file.blue()
                 );
 
-                impacted_files.insert(base_file.clone());
-                impacted_files.insert(other_file.clone());
+                impacted_files.insert(base_file);
+                impacted_files.insert(other_file);
                 local_errors = true;
             }
         }
 
+        for key in unused_keys.iter() {
+            let local_key = key.as_str();
+
+            if other_keys.contains(&local_key.to_string()) {
+                println!("{}", "⚠️ Unused key found in translation:".bold().yellow());
+                let file: String = get_translation_file(&file_mapping, lang, local_key);
+                println!("   - Key: {} | File: {}", key.yellow(), file.blue());
+                local_errors = true;
+            }
+        }
+
+        // Update the error status if any error is found
         if local_errors {
-            *has_errors.lock().unwrap() = true;
-            impacted_folders.insert(lang.to_string());
+            has_errors.store(true, Ordering::Relaxed);
         }
     });
 
-    // Return whether errors were found
-    *has_errors.lock().unwrap()
+    has_errors.load(Ordering::Relaxed)
 }
 
-// Loads all translation files and checks consistency in parallel
 fn main() {
     let args: Vec<String> = env::args().collect();
     let base_path = args
@@ -177,19 +228,6 @@ fn main() {
         })
         .collect();
 
-    // Print out found language folders and file statistics
-    let total_folders = lang_folders.len();
-    let total_files: usize = lang_folders
-        .par_iter()
-        .map(|lang| {
-            let pattern = format!("{}/{}/*.json", base_path, lang);
-            glob(&pattern)
-                .expect("Failed to read glob pattern")
-                .filter(|entry| entry.is_ok())
-                .count()
-        })
-        .sum();
-
     let translations = Arc::new(DashMap::new());
     let file_mapping = Arc::new(DashMap::new());
 
@@ -200,13 +238,11 @@ fn main() {
 
         for entry in glob(&pattern).expect("Failed to read glob pattern") {
             if let Ok(path) = entry {
-                let file = File::open(&path).expect("Failed to open file");
-                let mmap = unsafe { Mmap::map(&file).expect("Failed to map file") };
-                let content = str::from_utf8(&mmap).expect("Invalid UTF-8");
-                let json: Value = serde_json::from_str(content).expect("Invalid JSON");
+                let content = fs::read_to_string(&path).expect("Failed to read file");
+                let json: Value = serde_json::from_str(&content).expect("Invalid JSON");
 
                 let mut flattened = DashMap::new();
-                flatten_json(&json, "".to_string(), &mut flattened);
+                flatten_json(&json, String::new(), &mut flattened);
 
                 for (key, value) in flattened {
                     translations_keys_and_values.insert(key.clone(), value);
@@ -219,62 +255,24 @@ fn main() {
         file_mapping.insert(lang.to_string(), translations_keys_and_paths);
     });
 
-    let translations = Arc::clone(&translations);
-    let file_mapping = Arc::clone(&file_mapping);
-
-    let has_errors = check_translations("fr", Arc::clone(&translations), Arc::clone(&file_mapping));
-
-    // End of process summary
-    let impacted_folders = translations
-        .as_ref()
-        .iter()
-        .filter_map(|entry| {
-            let (lang, _keys) = entry.pair();
-            if lang != "fr" {
-                Some(lang.to_string())
-            } else {
-                None
-            }
-        })
-        .collect::<HashSet<String>>();
-
-    println!(
-        "{} {} language folders found.",
-        "ℹ️ Info:".bold().cyan(),
-        total_folders
+    let has_errors = check_translations(
+        "fr",
+        translations.clone(),
+        file_mapping.clone(),
+        &DashSet::new(),
     );
 
-    println!(
-        "{} {} translation files found across all folders.",
-        "ℹ️ Info:".bold().cyan(),
-        total_files
-    );
+    let files: Vec<PathBuf> = ["ts", "js", "vue"]
+        .par_iter()
+        .flat_map(|ext| get_all_files_by_extension(Path::new("../../circularx/webapp/src"), ext))
+        .collect();
 
-    println!(
-        "\n{}",
-        "🌍 Translation Consistency Check Complete"
-            .bold()
-            .underline()
-    );
+    let base_translation = translations.get("fr").unwrap();
+    let base_keys: HashSet<String> = base_translation.keys().cloned().collect();
 
-    if has_errors {
-        println!(
-            "{} {} language(s) impacted with inconsistent keys/variables.",
-            "❌ Error:".bold().red(),
-            impacted_folders.len()
-        );
+    let unused_keys = check_translations_usage(&base_keys, &files);
 
-        println!(
-            "{} {} file(s) impacted by variable mismatches.",
-            "❌ Error:".bold().red(),
-            impacted_folders.len()
-        );
-        process::exit(1);
-    } else {
-        println!(
-            "{} No translation issues found.",
-            "✅ Success:".bold().green()
-        );
-        process::exit(0);
-    }
+    println!("Unused keys: {:?}", unused_keys.len());
+
+    process::exit(if has_errors { 1 } else { 0 });
 }
