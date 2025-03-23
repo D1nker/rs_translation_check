@@ -116,7 +116,7 @@ fn check_translations(
     base_lang: &str,
     translations: Arc<DashMap<String, HashMap<String, String>>>,
     file_mapping: Arc<DashMap<String, HashMap<String, String>>>,
-    unused_keys: &DashSet<String>, // We're now using unused_keys here
+    unused_keys: &DashSet<String>,
 ) -> bool {
     let base_translation = translations.get("fr").unwrap();
     let base_keys: HashSet<_> = base_translation.keys().collect();
@@ -198,7 +198,6 @@ fn check_translations(
             }
         }
 
-        // Update the error status if any error is found
         if local_errors {
             has_errors.store(true, Ordering::Relaxed);
         }

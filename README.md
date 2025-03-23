@@ -6,6 +6,7 @@ This Rust script checks the consistency of translation files across multiple lan
 - All languages have the same translation keys.
 - There are no missing or extra keys in any language.
 - Variables within translations (e.g., `{productName}`) are consistent across all languages.
+- (new) It also checks for translation key usages into a given folder & subfolders.
 
 ## Features
 
@@ -44,7 +45,7 @@ cargo run -- /path/to/your/translation/files
 If no path is provided, it defaults to:
 
 ```sh
-./webapp/src/assets/i18n
+../../circularx/webapp/src/assets/i18n
 ```
 
 ### Expected File Structure
@@ -95,6 +96,7 @@ Your translation files should be organized in separate folders for each language
    - Found variables (DE): {"username"}
    - Location: Expected in fr/common.json but found in de/messages.json
 ❌ Translation issues found. Exiting with error.
+❌ Unused keys: 622
 ```
 
 ### Detailed Output
@@ -126,8 +128,9 @@ This project uses the following Rust crates:
 - `colored` for colorized terminal output.
 - `glob` for reading JSON files in multiple directories.
 - `rayon` for parallel processing to improve performance.
-- `regex` for extracting variables.
 - `serde_json` for parsing JSON.
+- `dashmap` for concurrent hashmap access.
+- `arc` for atomic reference counting.
 
 ## Contributing
 
